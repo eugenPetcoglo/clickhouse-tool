@@ -1,169 +1,111 @@
 # Clickhouse-tool
 
-Локальный backend для ручного backup и restore ClickHouse по принципу pgAdmin. Node.js и `clickhouse-client` работают на ноутбуке. Frontend на React будет добавлен отдельно.
+A local tool for manual ClickHouse backup and restore, following the pgAdmin workflow. The backend and `clickhouse-client` run on your laptop. The React frontend is planned.
 
-Backup сохраняет `.chbackup` на ноутбуке и заканчивается. Restore запускается отдельной командой: тот же файл можно восстановить в localhost и затем независимо на dev. Исходный сервер и его профиль для restore не нужны.
+Backup saves a `.chbackup` file locally. Restore is a separate action that sends that file to a selected server. The source connection is no longer needed, and the same file can be restored independently to localhost or dev.
 
-## Запуск
+## Start
 
-Нужны Linux, Node.js **24**, npm и установленный `clickhouse-client`. Для SSH-подключений нужен OpenSSH `ssh` с ключом или агентом и заранее проверенной записью сервера в `known_hosts`.
+Requirements: Linux, Node.js 24, npm, and `clickhouse-client` on your PATH.
+
+From the project root:
 
 ```bash
 npm install
 npm run backend:dev
 ```
 
-Backend: `http://127.0.0.1:3001`. Документация API: `http://127.0.0.1:3001/docs/`. В Swagger UI нажмите **Authorize** и введите `1` для заголовка приложения.
+Open [Swagger UI](http://127.0.0.1:3001/docs/). Click **Authorize** and enter `1` for the application header. `GET /api/health` reports the CLI version or returns `503` if the CLI is unavailable.
 
-Из `apps/backend`:
+For a production build, run `npm run backend:build`, then `npm run backend:start`. From `apps/backend`, development starts with `npm run start:dev`.
 
-```bash
-npm run start:dev
-```
+## Backup and restore
 
-Сборка и запуск из корня:
+Use Swagger UI to send the requests below. Commands use JSON and require `X-Clickhouse-Tool: 1`; file imports use multipart instead. Replace the example IDs with values returned by the API.
 
-```bash
-npm run backend:build
-npm run backend:start
-```
+1. Create a profile with `POST /api/connections`:
 
-`GET /api/health` возвращает готовность и версию CLI. При отсутствии CLI backend запускается, а readiness возвращает `503` с объяснением.
+   ```json
+   {"name":"Source","host":"127.0.0.1","port":9000,"username":"default","tls":false}
+   ```
 
-## Настройки
+   Use the ClickHouse **native TCP port**, usually `9000`, or `9440` with TLS. Connect through `POST /api/connections/CONNECTION_ID/connect` with `{"password":"..."}`. List available databases through `GET /api/connections/CONNECTION_ID/databases`.
 
-Переменные окружения необязательны. `.env` автоматически не загружается; задайте переменные в терминале или настройках запуска IDE.
+2. Start a backup with `POST /api/backups`:
 
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `HOST` | `127.0.0.1` | Только loopback: также допустимы `localhost` и `::1` |
-| `PORT` | `3001` | Порт backend |
-| `DATA_DIR` | `~/.local/share/clickhouse-tool` | Профили, задачи, копии и временные файлы |
-| `CLICKHOUSE_CLIENT_PATH` | `clickhouse-client` | Путь к установленному CLI |
-| `ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Разрешённые адреса frontend через запятую |
-| `MAX_BACKUP_BYTES` | `1099511627776` | Максимальный размер импортируемого файла, 1 TiB |
+   ```json
+   {"sourceConnectionId":"CONNECTION_ID","database":"analytics"}
+   ```
 
-Если задан `XDG_DATA_HOME`, каталог по умолчанию — `$XDG_DATA_HOME/clickhouse-tool`.
+   Long operations return `202` with a `jobId`. Poll `GET /api/jobs/JOB_ID` about once per second until the status is `succeeded`, `failed`, `cancelled`, or `interrupted`. A successful backup result contains its ID and local path. Browse copies with `GET /api/backups` or download one through `GET /api/backups/BACKUP_ID/file`.
 
-```text
-DATA_DIR/
-├── connections.json
-├── jobs/                # состояние и журнал операций
-├── backups/             # готовые .chbackup
-└── runtime/             # временные приватные конфигурации CLI
-```
+   To use a file saved earlier, upload it through `POST /api/backups/import` as one multipart file. This request stays open through upload and validation, then returns `jobId` and `backup`. Use the returned backup ID; incomplete uploads are discarded.
 
-Пароли подключений живут только в памяти процесса. Профиль, архив и журнал их не содержат. CLI получает пароль через временный файл с правами `0600`; после команды файл удаляется. После аварийного завершения процесса проверьте и удалите оставшиеся каталоги `runtime/cli-*`, когда backend остановлен. Архивы содержат данные БД и требуют соответствующей защиты на ноутбуке.
+3. Connect the destination profile and select a restore mode:
 
-## Подключение и backup
+   | Mode | Behavior |
+   | --- | --- |
+   | `replace-data` | Require an existing database with matching structure, clear its tables, and load the copy. |
+   | `create-new` | Create the database under its original name, which must be available. Database renaming is not supported. |
 
-Все изменяющие запросы требуют `X-Clickhouse-Tool: 1`. Команды принимают JSON. Backend проверяет локальный `Host` и разрешённый `Origin`.
+   Start a check with `POST /api/restores/check`:
 
-Создайте профиль; порт — **native TCP**, обычно `9000`, с TLS обычно `9440`:
+   ```json
+   {"backupId":"BACKUP_ID","targetConnectionId":"TARGET_ID","mode":"replace-data"}
+   ```
 
-```bash
-curl -X POST http://127.0.0.1:3001/api/connections \
-  -H 'X-Clickhouse-Tool: 1' -H 'Content-Type: application/json' \
-  -d '{"name":"Prod","host":"clickhouse.example.com","port":9440,"username":"backup_user","tls":true}'
-```
+4. Wait for the check to succeed and inspect its result: destination server, database, and planned actions. Pause writes and migrations on the destination, then confirm with `POST /api/restores`:
 
-В следующих примерах замените `CONNECTION_ID`, `BACKUP_ID` и `JOB_ID` значениями из ответов. Подключитесь; пароль отправляйте из формы приложения или безопасного HTTP-клиента, чтобы не сохранять его в истории терминала:
+   ```json
+   {"checkJobId":"CHECK_JOB_ID","confirmationName":"analytics","targetWritesPaused":true}
+   ```
 
-```http
-POST /api/connections/CONNECTION_ID/connect
-X-Clickhouse-Tool: 1
-Content-Type: application/json
+   The database name must match exactly. The backend rechecks the file and destination before making changes. Restore is not transactional: a failure can leave partially restored data.
 
-{"password":"..."}
-```
+Views are detached during loading and reattached after every table succeeds, preventing materialized views from filling aggregates twice. Empty tables are cleared too. Stored computed columns and aggregate states are imported without recalculation or finalization.
 
-Успешное подключение проверяет авторизацию, идентификатор сервера, версию и необходимые настройки ClickHouse. Список баз: `GET /api/connections/CONNECTION_ID/databases`.
+## Jobs and recovery
 
-```http
-POST /api/backups
-X-Clickhouse-Tool: 1
-Content-Type: application/json
+One long operation runs at a time; another receives `409 BACKEND_BUSY`. Closing the browser does not stop an accepted background job. To cancel it, send `POST /api/jobs/JOB_ID/cancel`. The backend stops the CLI and attempts to kill its own server query.
 
-{"sourceConnectionId":"CONNECTION_ID","database":"analytics"}
-```
+Job status includes the phase, current table, completed objects, bytes, query ID, and change journal. After a restart, unfinished jobs become `interrupted`. `requiresRecovery: true` means the destination may have changed. Partial inserts are never retried automatically, and partially created databases are not deleted automatically.
 
-Ответ `202 {"jobId":"..."}`. Опрос состояния: `GET /api/jobs/JOB_ID`, примерно раз в секунду. После `status: "succeeded"` поле `result` содержит ID и путь готовой копии. Автоматического restore нет. Список: `GET /api/backups`; скачивание: `GET /api/backups/BACKUP_ID/file`.
+To retry a restore with `requiresRecovery: true`:
 
-Файл всегда хранится на машине backend. В этой версии backend запускается на ноутбуке, поэтому это локальный файл пользователя. Произвольный путь с диска через HTTP не принимается.
+1. Keep destination writes and migrations paused. Inspect the failed job and ensure its recorded query has stopped on the server.
+2. Reconnect the destination. Submit the same backup, destination, and mode to `/api/restores/check`, adding `recoveryJobId` from the failed restore job.
+3. Review the new check and confirm it through `/api/restores`.
 
-## Импорт файла и restore
+A retry reloads the full table set. Its journal identifies detached views and compatible objects from a partial database creation. Detached view definitions are verified before tables are cleared. Keep the backup and job files until recovery finishes. If database creation succeeded without a completed journal record, an administrator must inspect that database before retrying.
 
-Чтобы использовать ранее сохранённый файл, загрузите его потоковым multipart-запросом. Импорт возвращает новый локальный ID; имя файла и ID внутри manifest не определяют путь хранения.
+## Configuration and storage
 
-```bash
-curl -X POST http://127.0.0.1:3001/api/backups/import \
-  -H 'X-Clickhouse-Tool: 1' -F 'file=@/absolute/path/copy.chbackup'
-```
+Set environment variables in your shell or IDE. `.env` files are not loaded automatically.
 
-Запрос импорта остаётся открытым до завершения загрузки и проверки. Ответ содержит `jobId` и `backup`. Оборванный или повреждённый файл не появляется как готовая копия.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | Loopback only; `localhost` and `::1` are also accepted. |
+| `PORT` | `3001` | Backend port. |
+| `DATA_DIR` | `~/.local/share/clickhouse-tool` | Profiles, jobs, backups, and temporary files. |
+| `CLICKHOUSE_CLIENT_PATH` | `clickhouse-client` | CLI executable path. |
+| `ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Comma-separated frontend origins. |
+| `MAX_BACKUP_BYTES` | `1099511627776` | Maximum imported file size, 1 TiB. |
 
-Подключитесь к назначению и запустите проверку:
+When `XDG_DATA_HOME` is set, the default data directory is `$XDG_DATA_HOME/clickhouse-tool`. It contains `connections.json`, `jobs/`, `backups/`, and `runtime/`.
 
-```http
-POST /api/restores/check
-X-Clickhouse-Tool: 1
-Content-Type: application/json
+Profiles omit passwords. Each CLI command uses a temporary private configuration file with permissions `0600`. After a crash, stop the backend and remove any leftover `runtime/cli-*` directories. Protect backup files as you would the database data itself.
 
-{"backupId":"BACKUP_ID","targetConnectionId":"CONNECTION_ID","mode":"replace-data"}
-```
-
-Режимы:
-
-- `replace-data`: существующая БД с полностью совпадающей структурой; очищаются и загружаются все физические таблицы копии, включая пустые.
-- `create-new`: исходное имя БД должно быть свободно; создаются БД, структура и данные. Переименования БД нет.
-
-Проверка — задача с ответом `202`. Дождитесь `succeeded`, прочитайте `result`: сервер, база, версии, действия и предупреждения. **Приостановите запись и миграции на назначении.** Затем подтвердите точным именем БД:
-
-```http
-POST /api/restores
-X-Clickhouse-Tool: 1
-Content-Type: application/json
-
-{"checkJobId":"CHECK_JOB_ID","confirmationName":"analytics","targetWritesPaused":true}
-```
-
-Перед первым изменением backend заново проверяет весь архив и назначение. Изменившийся файл или структура требуют новой проверки. Restore не является транзакцией: ошибка после очистки может оставить частично восстановленные данные.
-
-Views временно отключаются, данные физических таблиц загружаются последовательно, views подключаются после успешной загрузки всех таблиц. Это предотвращает повторное наполнение агрегатов materialized views. Сохраняемые вычисляемые колонки передаются явно. Настройки импорта: `insert_allow_materialized_columns=1`, `async_insert=0`, `optimize_on_insert=0`.
-
-## Отмена и восстановление после сбоя
-
-Одновременно выполняется одна длительная операция. Остальные получают `409 BACKEND_BUSY`. Закрытие браузера не отменяет задачу. Отмена: `POST /api/jobs/JOB_ID/cancel` с заголовком приложения. Backend останавливает CLI и отправляет `KILL QUERY` только для своего query ID.
-
-Состояние содержит этап, текущую таблицу, завершённые объекты (`completedObjects`), байты, query ID и журнал изменений. После перезапуска незавершённая задача получает `interrupted`. `requiresRecovery: true` означает, что назначение могло измениться. Частичные INSERT автоматически не повторяются; частично созданная новая БД автоматически не удаляется.
-
-Для явного повтора:
-
-1. Оставьте запись и миграции назначения остановленными.
-2. Изучите `GET /api/jobs/JOB_ID`: действия, ошибку и `queryId`. После аварийного завершения убедитесь на сервере, что этот запрос завершился; при необходимости остановите его с правами администратора.
-3. Повторно подключитесь к назначению.
-4. В `POST /api/restores/check` передайте прежние `backupId`, `targetConnectionId`, `mode` и `recoveryJobId` неудачной задачи restore.
-5. Проверьте результат и подтвердите новой командой `POST /api/restores`.
-
-Повтор восстанавливает весь набор таблиц. Только журнал данного restore разрешает учитывать отключённые views и совместимую частично созданную БД. Изменённые вручную объекты или другой сервер блокируют повтор. Сохраняйте каталоги `jobs/` и исходную копию до завершения восстановления.
-
-При подтверждённом повторе ранее отключённые views сначала временно подключаются для проверки сохранённого определения и снова отключаются. Проверка выполняется до очистки таблиц; изменённые определения блокируют загрузку.
-
-Если процесс остановился после создания БД, но до записи подтверждения этого шага в журнал, backend не считает существующую БД своей. Такой случай требует ручной проверки назначения и решения администратора; автоматического удаления БД нет.
-
-## SSH и TLS
-
-В профиль можно добавить `ssh`:
+SSH requires OpenSSH, key or agent authentication, and a verified server entry in `known_hosts`. Add an optional `ssh` object to a connection profile:
 
 ```json
-{"host":"127.0.0.1","port":9000,"name":"Dev via SSH","username":"default","tls":false,"ssh":{"host":"dev.example.com","port":22,"username":"developer","identityFile":"/home/user/.ssh/id_ed25519"}}
+{"ssh":{"host":"dev.example.com","port":22,"username":"developer","identityFile":"/home/user/.ssh/id_ed25519"}}
 ```
 
-Внешние `host` и `port` — адрес ClickHouse с точки зрения SSH-сервера. SSH создаёт локальный туннель; CLI и архив остаются на ноутбуке. Парольный интерактивный SSH и автоматическое принятие неизвестного host key не поддерживаются. TLS проверяет сертификат; `tlsServerName` позволяет явно указать имя сертификата при туннелировании.
+The profile's outer `host` and `port` identify ClickHouse as seen from the SSH server. TLS verifies certificates, and `tlsServerName` can specify the certificate hostname when tunneling.
 
-## Формат и поддержка v1
+## Format and supported scope
 
-`.chbackup` — ZIP64-контейнер без дополнительного сжатия:
+A `.chbackup` is an uncompressed ZIP64 archive:
 
 ```text
 manifest.json
@@ -172,27 +114,21 @@ schema/<object-id>.sql
 data/<table-id>.native
 ```
 
-Manifest версии `1` содержит версии сервера и CLI, исходное имя, DDL/колонки/зависимости, интервалы экспорта таблиц, размеры и SHA-256 обязательных файлов. При проверке отклоняются дубликаты, посторонние файлы, небезопасные пути, несовпадающие размеры и хеши. Незавершённые `.partial` не считаются копиями. DDL сохраняется без исходных UUID. Native передаётся потоками без преобразования строк в JavaScript-объекты.
+The version 1 manifest records the database, server and CLI versions, object definitions and dependencies, table export intervals, file sizes, and SHA-256 hashes. Import and restore validate archive contents, sizes, and hashes before any destination changes. DDL omits source UUIDs. Native data is streamed without converting rows to JavaScript objects. Files are published only after completion; unfinished `.partial` files are not backups.
 
-Поддерживаются одиночные серверы, базы Atomic/Ordinary, `MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree`, обычные views и incremental materialized views с явным `TO` в этой же БД. Restore требует одинаковую **major/minor** версию ClickHouse. CLI должен поддерживать используемые сервером Native-типы и настройки; рекомендуем ту же версию, что у сервера.
+Supported: standalone servers, Atomic/Ordinary databases, `MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree`, ordinary views, and incremental materialized views with an explicit `TO` table in the same database. Restore requires the same ClickHouse major/minor version as the source. Required storage policies must already exist on the destination.
 
-Кластеры, replicated/shared-движки, refreshable views, внутренние таблицы materialized views и зависимости между БД отклоняются. Пользовательские storage policies должны уже существовать на назначении. Конфигурация ClickHouse, Docker Compose, пользователи, роли и внешние ресурсы в копию не входят.
+Unsupported: clusters, replicated/shared engines, refreshable views, materialized views with hidden inner tables, cross-database dependencies, table functions, Dictionary/Join-engine dependencies, and named CTEs. View dependencies cannot use database or object names containing dots or newlines. Nested SELECT queries are supported. These restrictions are checked using metadata and `EXPLAIN AST` during backup and restore.
 
-SQL проверяется локально и через `EXPLAIN AST` сервера без выполнения сохранённых CREATE-команд. В v1 views используют объекты этой же БД; табличные функции, обращения к Dictionary/Join-движкам и именованные CTE отклоняются. Обычные вложенные SELECT поддерживаются. Имена БД и объектов, на которые ссылаются views, не должны содержать точку или перевод строки: вывод парсера не позволяет безопасно отличить такие имена от межбазовых ссылок. Эти ограничения проверяются и при создании копии.
+The source may keep receiving writes. Tables are exported sequentially, without a database-wide snapshot; detected schema changes prevent publication. Destination TTL rules and merges still apply, so matching row counts alone do not prove correctness. Server configuration, users, roles, and external resources are outside the backup.
 
-Источник может продолжать принимать данные: копия содержит последовательные выгрузки таблиц, без гарантии общего момента снимка всей БД. Проверка схемы в конце backup блокирует публикацию при обнаруженном изменении структуры. Состояния агрегатов сохраняются в Native без `FINAL` и финализации. TTL и фоновые слияния работают по правилам назначения; одинаковый `count()` не является универсальным критерием корректности.
+The ClickHouse user needs access to relevant `system` metadata and `SHOW CREATE`, plus `SELECT` for backup. Restore needs `INSERT`, `TRUNCATE`, view `ATTACH`/`DETACH`, and creation privileges for `create-new`. Cancellation needs permission to stop its own query. Scope grants to the intended database.
 
-## Необходимые права ClickHouse
+## Development
 
-Профиль должен видеть метаданные в `system.databases`, `system.tables`, `system.columns`, `system.settings`, `system.storage_policies`, `system.detached_tables` и результат `SHOW CREATE` для выбранной БД. Для backup нужен `SELECT` на таблицы. Для restore нужны `INSERT`, `TRUNCATE`, права создания БД/таблиц/views для `create-new`, а также права `DETACH`/`ATTACH` views. Отмена требует права завершить собственный запрос. Набор прав администратор ограничивает выбранной БД согласно используемой версии ClickHouse.
+`apps/backend/src/app.ts` assembles Fastify; `server.ts` starts it. The `connections`, `clickhouse`, `backups`, `restores`, and `jobs` modules contain functions independent of HTTP. `error-handler.ts` handles request errors centrally; job failures and resource cleanup are handled where those operations run. `apps/frontend/` is reserved for React.
 
-## Структура кода и проверки
-
-`apps/backend/src/app.ts` собирает HTTP-приложение, `server.ts` запускает его. Модули `connections`, `clickhouse`, `backups`, `restores`, `jobs` содержат отдельные сценарии. Бизнес-логика принимает явные аргументы и не зависит от Fastify или будущего React/desktop-интерфейса. Отдельные PostgreSQL, Redis и очередь не требуются.
-
-HTTP-ошибки обрабатываются централизованно в `error-handler.ts` через Fastify `setErrorHandler`. Ошибки фоновых операций сохраняются в `jobs`; локальные `catch` и `finally` используются для освобождения ресурсов и перевода ошибок CLI, файлов и архивов в понятные сообщения.
-
-Из `apps/backend`:
+From `apps/backend`:
 
 ```bash
 npm run typecheck
@@ -201,10 +137,4 @@ npm test
 npm run build
 ```
 
-`npm test` запускает три e2e-сценария через HTTP API и настоящий ClickHouse:
-
-- Создание файла копии, удаление профиля источника и независимый restore в новые базы на двух назначениях.
-- Замена существующих данных с проверкой вычисляемых колонок, агрегатов и пустых таблиц.
-- Отказ при повреждённом файле или несовпадении схемы до изменения данных назначения.
-
-Тесты находятся в `tests/e2e/` и запускают временные ClickHouse-серверы с отдельными каталогами и портами. Нужен локальный бинарный `clickhouse` с подкомандами `server` и `client`. Существующие базы не используются. `npm run test:e2e` запускает те же сценарии.
+The three e2e scenarios in `tests/e2e/` cover file backup and independent restores after source profile deletion, data replacement including computed columns and aggregates, and rejection of damaged files or schema mismatches before destination changes. They use real HTTP requests and temporary ClickHouse servers with isolated ports and directories. Running them requires the local `clickhouse` binary with `server` and `client` subcommands; existing databases are not used.
