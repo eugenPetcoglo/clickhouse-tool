@@ -190,6 +190,8 @@ SQL проверяется локально и через `EXPLAIN AST` серв
 
 `apps/backend/src/app.ts` собирает HTTP-приложение, `server.ts` запускает его. Модули `connections`, `clickhouse`, `backups`, `restores`, `jobs` содержат отдельные сценарии. Бизнес-логика принимает явные аргументы и не зависит от Fastify или будущего React/desktop-интерфейса. Отдельные PostgreSQL, Redis и очередь не требуются.
 
+HTTP-ошибки обрабатываются централизованно в `error-handler.ts` через Fastify `setErrorHandler`. Ошибки фоновых операций сохраняются в `jobs`; локальные `catch` и `finally` используются для освобождения ресурсов и перевода ошибок CLI, файлов и архивов в понятные сообщения.
+
 Из `apps/backend`:
 
 ```bash

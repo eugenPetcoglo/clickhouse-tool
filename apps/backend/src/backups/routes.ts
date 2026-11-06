@@ -28,13 +28,12 @@ export function registerBackupRoutes(app: FastifyInstance, config: Config, clien
   });
   server.post('/api/backups/import', { schema: { tags: ['backups'], consumes: ['multipart/form-data'] } }, async (request, reply) => {
     const upload = await readBackupUpload(request.raw, config.maxUploadBytes);
-    const job = await jobs.start('import', {}, context => importBackup(config.dataDir, upload.stream, config.maxUploadBytes, context)).catch(error => {
-      upload.discard();
-      throw error;
-    });
-    const aborted = () => { void jobs.cancel(job.id).catch(() => undefined); };
+    let jobId: string | undefined;
+    const aborted = () => { if (jobId) void jobs.cancel(jobId).catch(() => undefined); };
     request.raw.once('aborted', aborted);
     try {
+      const job = await jobs.start('import', {}, context => importBackup(config.dataDir, upload.stream, config.maxUploadBytes, context));
+      jobId = job.id;
       // Keep the upload request open until its body is consumed; otherwise Fastify can close the stream.
       const completed = await jobs.wait(job.id);
       if (completed.status !== 'succeeded') throw new AppError(completed.error?.code ?? 'INVALID_BACKUP', completed.error?.message ?? 'Import failed.', completed.error?.code === 'UPLOAD_TOO_LARGE' ? 413 : 422);
