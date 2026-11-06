@@ -10,11 +10,8 @@ export type { RestoreCheck, RestoreInput, RestoreRecovery } from './types.js';
 
 export async function checkRestore(input: RestoreInput, context?: OperationContext): Promise<RestoreCheck> {
   const prepared = await prepareRestore(input, context);
-  try {
-    return prepared.check;
-  } finally {
-    await prepared.backup.close();
-  }
+  await prepared.backup.close();
+  return prepared.check;
 }
 
 /** Execution keeps the verified archive open, so data is read from that same file. */

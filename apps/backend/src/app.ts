@@ -1,9 +1,10 @@
-import Fastify, { type FastifyError } from 'fastify';
+import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import type { Config } from './config.js';
 import { AppError } from './errors.js';
+import { errorHandler } from './error-handler.js';
 import { createClickHouseClient } from './clickhouse/client.js';
 import { createConnectionService } from './connections/service.js';
 import { registerConnectionRoutes } from './connections/routes.js';
@@ -23,12 +24,12 @@ export async function createApp(config: Config, dependencies: { client?: ClickHo
   const client = dependencies.client ?? createClickHouseClient(config);
   const connections = createConnectionService(config, client);
   const jobs = await createJobManager(config.dataDir);
+  app.setErrorHandler(errorHandler);
 
   app.addHook('onRequest', async (request, reply) => {
     const host = request.headers.host ?? '';
-    let hostname: string;
-    try { hostname = new URL(`http://${host}`).hostname; } catch { throw new AppError('INVALID_HOST', 'Invalid Host header.', 403); }
-    if (!['localhost', '127.0.0.1', '[::1]'].includes(hostname)) throw new AppError('INVALID_HOST', 'Only local application requests are allowed.', 403);
+    const hostname = URL.parse(`http://${host}`)?.hostname;
+    if (!hostname || !['localhost', '127.0.0.1', '[::1]'].includes(hostname)) throw new AppError('INVALID_HOST', 'Only local application requests are allowed.', 403);
     const origin = request.headers.origin;
     if (origin && origin !== `http://${host}` && !config.allowedOrigins.includes(origin)) {
       throw new AppError('INVALID_ORIGIN', 'This browser origin is not allowed.', 403);
@@ -43,12 +44,6 @@ export async function createApp(config: Config, dependencies: { client?: ClickHo
     if (request.url.startsWith('/api/') && !['GET', 'HEAD'].includes(request.method) && request.headers['x-clickhouse-tool'] !== '1') {
       throw new AppError('APP_HEADER_REQUIRED', 'Send X-Clickhouse-Tool: 1 for application commands.', 403);
     }
-  });
-  app.setErrorHandler<FastifyError>((error, _request, reply) => {
-    if (error instanceof AppError) return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
-    if (error.validation) return reply.code(400).send({ error: { code: 'INVALID_REQUEST', message: error.message } });
-    if (error.statusCode && error.statusCode < 500) return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
-    return reply.code(500).send({ error: { code: 'INTERNAL_ERROR', message: 'The operation failed. Check local storage and application configuration.' } });
   });
   await app.register(multipart, { limits: { files: 1, fields: 0, fileSize: config.maxUploadBytes } });
   await app.register(swagger, {
@@ -65,10 +60,7 @@ export async function createApp(config: Config, dependencies: { client?: ClickHo
   });
   await app.register(swaggerUi, { routePrefix: '/docs' });
 
-  app.get('/api/health', { schema: { tags: ['health'] } }, async (_request, reply) => {
-    try { return { ready: true, cliVersion: await client.version() }; }
-    catch { return reply.code(503).send({ ready: false, error: 'Install clickhouse-client and check CLICKHOUSE_CLIENT_PATH.' }); }
-  });
+  app.get('/api/health', { schema: { tags: ['health'] } }, async () => ({ ready: true, cliVersion: await client.version() }));
   app.get('/api/openapi.json', { schema: { hide: true } }, () => app.swagger());
   app.get('/api/connections/:id/databases', {
     schema: { tags: ['connections'], params: { type: 'object', properties: { id: { type: 'string', format: 'uuid' } }, required: ['id'] } },

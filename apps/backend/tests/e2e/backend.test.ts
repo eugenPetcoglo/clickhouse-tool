@@ -117,6 +117,7 @@ afterAll(async () => {
 });
 
 it('backs up to a file and restores it to independent destinations after deleting the source profile', async () => {
+  expect((await json<{ ready: boolean }>('GET', '/health')).ready).toBe(true);
   expect(await client.query(target, `SELECT name FROM system.databases WHERE name = '${database}'`)).toEqual([]);
   await json('POST', `/connections/${sourceProfile.id}/disconnect`, undefined, 204);
   await json('DELETE', `/connections/${sourceProfile.id}`, undefined, 204);
@@ -159,6 +160,10 @@ it('rejects a damaged backup and a schema mismatch before changing destination d
   const request = { backupId: backup.id, targetConnectionId: targetProfile.id, mode: 'replace-data' };
   const damaged = await json<{ jobId: string }>('POST', '/restores/check', request, 202);
   expect((await waitForJob(damaged.jobId)).status).toBe('failed');
+  const blocked = await json<{ error: { code: string } }>('POST', '/restores', {
+    checkJobId: damaged.jobId, confirmationName: database, targetWritesPaused: true,
+  }, 409);
+  expect(blocked.error.code).toBe('RESTORE_CHECK_REQUIRED');
   expect(await rows(target)).toEqual(expectedRows);
   expect(await total(target)).toBe(15);
 
