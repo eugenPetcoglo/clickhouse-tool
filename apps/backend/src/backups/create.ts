@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
+import { getDataTables, readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
 import { checkCreateStatements, checkParsedCreateStatements } from '../clickhouse/ddl.js';
 import { AppError } from '../errors.js';
 import type { ClickHouseClient, ConnectedConnection, OperationContext } from '../types.js';
@@ -32,12 +32,14 @@ export async function createBackup(input: CreateBackupInput, context: OperationC
     for (const object of schema.objects) {
       context.signal.throwIfAborted();
       files.push(await archive.addText(`schema/${object.id}.sql`, object.ddl));
-      if (object.kind !== 'table') continue;
-      await context.setPhase('exporting-table', object.name);
+    }
+    for (const table of getDataTables(schema)) {
+      context.signal.throwIfAborted();
+      await context.setPhase('exporting-table', table.name);
       const startedAt = new Date().toISOString();
-      files.push(await archive.addData(`data/${object.id}.native`, output => client.exportTable(connection, database, object, output, context)));
-      tableExports.push({ objectId: object.id, startedAt, finishedAt: new Date().toISOString() });
-      await context.completeObject?.(object.name);
+      files.push(await archive.addData(`data/${table.id}.native`, output => client.exportTable(connection, database, table, output, context)));
+      tableExports.push({ objectId: table.id, startedAt, finishedAt: new Date().toISOString() });
+      await context.completeObject?.(table.name);
     }
     await context.setPhase('checking-schema');
     const current = await readDatabaseSchema(client, connection, database, context);

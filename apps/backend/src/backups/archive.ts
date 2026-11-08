@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { PassThrough, Readable, Transform, Writable } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
 import { Reader, TextReader, ZipReader, ZipWriter, type FileEntry } from '@zip.js/zip.js';
-import { schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
+import { getDataTables, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
 import { AppError, errorMessage } from '../errors.js';
 import { ensureDirectory, idPath } from '../files.js';
 import type { OperationContext } from '../types.js';
@@ -203,7 +203,7 @@ async function openCheckedBackup(path: string, context?: OperationContext): Prom
       schema: manifest.schema,
       async readData(objectId) {
         if (closed) throw invalid('Backup reader has been closed.');
-        if (!manifest.schema.objects.some(object => object.id === objectId && object.kind === 'table')) throw invalid('Unknown data table.');
+        if (!getDataTables(manifest.schema).some(table => table.id === objectId)) throw invalid('Unknown data table.');
         const entry = opened.entries.get(`data/${objectId}.native`)!;
         const output = new PassThrough();
         streams.add(output);
@@ -315,8 +315,8 @@ function validateInventory(manifest: Manifest, entries: Map<string, FileEntry>):
   const expected = new Set(['schema/database.sql']);
   for (const object of manifest.schema.objects) {
     expected.add(`schema/${object.id}.sql`);
-    if (object.kind === 'table') expected.add(`data/${object.id}.native`);
   }
+  for (const table of getDataTables(manifest.schema)) expected.add(`data/${table.id}.native`);
   const declared = new Set(manifest.files.map(file => file.path));
   if (declared.size !== manifest.files.length || declared.size !== expected.size || entries.size !== expected.size + 1) throw invalid('Backup file inventory does not match its objects.');
   for (const file of manifest.files) {

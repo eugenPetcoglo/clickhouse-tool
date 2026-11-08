@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppError } from '../errors.js';
 import type { ClickHouseClient, ColumnInfo, ConnectedConnection, DatabaseSchema, OperationContext, SchemaObject } from '../types.js';
 import { quoteIdentifier } from './client.js';
-import { readSqlDependencies } from './ddl.js';
+import { readSqlDependencies, readViewHeader } from './ddl.js';
 
 const TABLE_ENGINES = new Set(['MergeTree', 'ReplacingMergeTree', 'SummingMergeTree', 'AggregatingMergeTree']);
 const DATABASE_ENGINES = new Set(['Atomic', 'Ordinary']);
@@ -10,6 +10,7 @@ const DATABASE_ENGINES = new Set(['Atomic', 'Ordinary']);
 interface TableRow {
   name: string;
   engine: string;
+  uuid?: string;
   storage_policy?: string;
   loading_dependencies_database?: string[];
   loading_dependencies_table?: string[];
@@ -43,8 +44,20 @@ export async function readDatabaseSchema(
   const foundDatabase = databases[0];
   if (!foundDatabase) throw new AppError('DATABASE_NOT_FOUND', `Database ${database} does not exist.`, 404);
   const available = new Set((await client.query<{ name: string }>(connection, "SELECT name FROM system.columns WHERE database = 'system' AND table = 'tables'", { context })).map((row) => row.name));
-  const optionalColumns = ['storage_policy', 'loading_dependencies_database', 'loading_dependencies_table', 'loading_dependent_database', 'loading_dependent_table', 'dependencies_database', 'dependencies_table', 'target_database', 'target_table', 'has_own_data'].filter((name) => available.has(name));
-  const tables = await client.query<TableRow>(connection, `SELECT name, engine${optionalColumns.map((name) => `, ${name}`).join('')} FROM system.tables WHERE database = {database:String} ORDER BY name`, options);
+  const optionalColumns = ['uuid', 'storage_policy', 'loading_dependencies_database', 'loading_dependencies_table', 'loading_dependent_database', 'loading_dependent_table', 'dependencies_database', 'dependencies_table', 'target_database', 'target_table', 'has_own_data'].filter((name) => available.has(name));
+  const rows = await client.query<TableRow>(connection, `SELECT name, engine${optionalColumns.map((name) => `, ${name}`).join('')} FROM system.tables WHERE database = {database:String} ORDER BY name`, options);
+  const definitions = new Map<string, string>();
+  const refreshTemporaryTables = new Set<string>();
+  for (const row of rows.filter(row => row.engine === 'MaterializedView')) {
+    const ddl = await readDdl(client, connection, `SHOW CREATE TABLE ${quoteIdentifier(database)}.${quoteIdentifier(row.name)}`, context);
+    definitions.set(row.name, ddl);
+    if (!readViewHeader(ddl, database).refreshable) continue;
+    // ClickHouse builds non-APPEND refresh results in a table owned by this view.
+    // Its exact name follows the view UUID, or its name in an Ordinary database.
+    const innerName = row.uuid && row.uuid !== '00000000-0000-0000-0000-000000000000' ? `inner_id.${row.uuid}` : `inner.${row.name}`;
+    refreshTemporaryTables.add(`.tmp.${innerName}`);
+  }
+  const tables = rows.filter(row => !refreshTemporaryTables.has(row.name));
   if (tables.some((row) => ['View', 'MaterializedView'].includes(row.engine)) && !available.has('loading_dependencies_table')) {
     throw new AppError('UNSUPPORTED_VERSION', 'This ClickHouse version does not expose the view dependencies required for safe restore.');
   }
@@ -52,9 +65,8 @@ export async function readDatabaseSchema(
   const databaseDdl = await readDdl(client, connection, `SHOW CREATE DATABASE ${quoteIdentifier(database)}`, context);
   const objects: SchemaObject[] = [];
   for (const row of tables) {
-    const ddl = await readDdl(client, connection, `SHOW CREATE TABLE ${quoteIdentifier(database)}.${quoteIdentifier(row.name)}`, context);
+    const ddl = definitions.get(row.name) ?? await readDdl(client, connection, `SHOW CREATE TABLE ${quoteIdentifier(database)}.${quoteIdentifier(row.name)}`, context);
     const header = readViewHeader(ddl, database);
-    if (row.engine === 'MaterializedView' && header.refreshable) throw new AppError('UNSUPPORTED_SCHEMA', `Refreshable materialized view ${row.name} is not supported.`);
     const kind = row.engine === 'View' ? 'view' : row.engine === 'MaterializedView' ? 'materialized-view' : 'table';
     const targetDatabase = row.target_database || header.targetDatabase;
     const targetTable = row.target_table || header.targetTable;
@@ -108,7 +120,7 @@ export function validateSupportedSchema(schema: DatabaseSchema): void {
       if (object.engine !== 'MaterializedView' || !object.targetTable || object.targetTable.startsWith('.inner')) {
         throw new AppError('UNSUPPORTED_SCHEMA', `Materialized view ${object.name} must have an explicit TO table in the same database.`);
       }
-      if (readViewHeader(object.ddl, schema.name).refreshable) throw new AppError('UNSUPPORTED_SCHEMA', `Refreshable materialized view ${object.name} is not supported.`);
+      readViewHeader(object.ddl, schema.name);
     }
     const columns = new Set<string>();
     const positions = new Set<number>();
@@ -162,6 +174,10 @@ export function orderViews(objects: SchemaObject[]): SchemaObject[] {
   return result;
 }
 
+export function getDataTables(schema: DatabaseSchema): SchemaObject[] {
+  return schema.objects.filter(object => object.kind === 'table').sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export function schemaFingerprint(schema: DatabaseSchema): string {
   const normalized = {
     name: schema.name, engine: schema.engine, ddl: schema.ddl.trim(),
@@ -192,34 +208,4 @@ function localDependencies(database: string, databases: string[] = [], tables: s
     if (databases[index] && databases[index] !== database) throw new AppError('UNSUPPORTED_SCHEMA', `Cross-database dependency ${databases[index]}.${table} is not supported.`);
     return table;
   });
-}
-
-// Only the CREATE header is tokenized. SQL bodies are preserved verbatim; we do
-// not rewrite queries or attempt to implement a ClickHouse SQL parser.
-function readViewHeader(ddl: string, database: string): { targetDatabase?: string; targetTable?: string; refreshable: boolean } {
-  const tokens = ddl.match(/`(?:\\.|``|[^`])*`|"(?:\\.|""|[^"])*"|'(?:\\.|''|[^'])*'|[A-Za-z_][A-Za-z_0-9]*|[().]|[^\s]/gs) ?? [];
-  let depth = 0;
-  let refreshable = false;
-  for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index]!;
-    if (token === '(') depth++;
-    if (token === ')') depth--;
-    if (depth !== 0) continue;
-    if (token.toUpperCase() === 'AS') break;
-    if (token.toUpperCase() === 'REFRESH') refreshable = true;
-    if (token.toUpperCase() !== 'TO') continue;
-    const first = tokens[index + 1];
-    if (!first) break;
-    if (tokens[index + 2] === '.' && tokens[index + 3]) {
-      return { targetDatabase: unquote(first), targetTable: unquote(tokens[index + 3]!), refreshable };
-    }
-    return { targetDatabase: database, targetTable: unquote(first), refreshable };
-  }
-  return { refreshable };
-}
-
-function unquote(token: string): string {
-  if (!token.startsWith('`') && !token.startsWith('"')) return token;
-  const quote = token[0]!;
-  return token.slice(1, -1).replaceAll(quote + quote, quote).replace(/\\(.)/gs, (_match, character: string) => ({ n: '\n', r: '\r', t: '\t' })[character] ?? character);
 }

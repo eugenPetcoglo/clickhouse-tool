@@ -62,7 +62,11 @@ Use Swagger UI to send the requests below. Commands use JSON and require `X-Clic
 
    The database name must match exactly. The backend rechecks the file and destination before making changes. Restore is not transactional: a failure can leave partially restored data.
 
-Views are detached during loading and reattached after every table succeeds, preventing materialized views from filling aggregates twice. Empty tables are cleared too. Stored computed columns and aggregate states are imported without recalculation or finalization.
+The app discovers table and view definitions, target tables, and dependencies automatically. Ordinary views and incremental materialized views are detached during loading and reattached after every table succeeds, preventing aggregates from filling twice. Refreshable materialized views stay attached: the app records their enabled state, stops them, and waits for the active refresh to finish before clearing any table. Stopping and waiting are limited to 60 seconds per view. After a successful restore, previously active schedules resume; previously stopped schedules remain stopped.
+
+For a new database, physical tables and their data are restored first, then views are created in dependency order. Refreshable views are created with `EMPTY` to skip the initial refresh and prevent an extra `APPEND`. Their schedules are enabled by default. The saved SQL is preserved; `EMPTY` is added only to the restore command. Natural scheduled refreshes may run after all physical data has loaded. The app does not force a refresh.
+
+Empty tables are cleared too. Stored computed columns and aggregate states are imported without recalculation or finalization.
 
 ## Jobs and recovery
 
@@ -76,7 +80,7 @@ To retry a restore with `requiresRecovery: true`:
 2. Reconnect the destination. Submit the same backup, destination, and mode to `/api/restores/check`, adding `recoveryJobId` from the failed restore job.
 3. Review the new check and confirm it through `/api/restores`.
 
-A retry reloads the full table set. Its journal identifies detached views and compatible objects from a partial database creation. Detached view definitions are verified before tables are cleared. Keep the backup and job files until recovery finishes. If database creation succeeded without a completed journal record, an administrator must inspect that database before retrying.
+A retry reloads the full table set. Its journal identifies detached views and compatible objects from a partial database creation. Detached ordinary and incremental view definitions are verified before tables are cleared. Refreshable views are never detached by restore. After failure or cancellation they remain stopped, and a successful retry restores their original enabled state from the first attempt's journal. Cleanup errors are reported with the original failure. Keep the backup and job files until recovery finishes. If database creation succeeded without a completed journal record, an administrator must inspect that database before retrying.
 
 ## Configuration and storage
 
@@ -116,17 +120,26 @@ data/<table-id>.native
 
 The version 1 manifest records the database, server and CLI versions, object definitions and dependencies, table export intervals, file sizes, and SHA-256 hashes. Import and restore validate archive contents, sizes, and hashes before any destination changes. DDL omits source UUIDs. Native data is streamed without converting rows to JavaScript objects. Files are published only after completion; unfinished `.partial` files are not backups.
 
-Supported: standalone servers, Atomic/Ordinary databases, `MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree`, ordinary views, and incremental materialized views with an explicit `TO` table in the same database. Restore requires the same ClickHouse major/minor version as the source. Required storage policies must already exist on the destination.
+Supported: standalone servers, Atomic/Ordinary databases, `MergeTree`, `ReplacingMergeTree`, `SummingMergeTree`, `AggregatingMergeTree`, ordinary views, and incremental or refreshable materialized views with an explicit `TO` table in the same database. Refreshable views can use schedules, `APPEND`, and local `DEPENDS ON` chains. Nested SELECT and UNION queries are supported. Each physical target table is copied once. Restore requires the same ClickHouse major/minor version as the source. Required storage policies must already exist on the destination.
 
-Unsupported: clusters, replicated/shared engines, refreshable views, materialized views with hidden inner tables, cross-database dependencies, table functions, Dictionary/Join-engine dependencies, and named CTEs. View dependencies cannot use database or object names containing dots or newlines. Nested SELECT queries are supported. These restrictions are checked using metadata and `EXPLAIN AST` during backup and restore.
+Unsupported: clusters, replicated/shared engines, materialized views with hidden inner tables (without explicit `TO`), `APPEND INCREMENTAL` (its processing cursor is not saved), cross-database dependencies, table functions, Dictionary/Join-engine dependencies, and named CTEs. View dependencies cannot use database or object names containing dots or newlines. These restrictions are checked using metadata and `EXPLAIN AST` during backup and restore.
 
 The source may keep receiving writes. Tables are exported sequentially, without a database-wide snapshot; detected schema changes prevent publication. Destination TTL rules and merges still apply, so matching row counts alone do not prove correctness. Server configuration, users, roles, and external resources are outside the backup.
 
-The ClickHouse user needs access to relevant `system` metadata and `SHOW CREATE`, plus `SELECT` for backup. Restore needs `INSERT`, `TRUNCATE`, view `ATTACH`/`DETACH`, and creation privileges for `create-new`. Cancellation needs permission to stop its own query. Scope grants to the intended database.
+The ClickHouse user needs access to relevant `system` metadata and `SHOW CREATE`, plus `SELECT` for backup. Restore needs `INSERT`, `TRUNCATE`, view `ATTACH`/`DETACH`, and creation privileges for `create-new`. Databases with refreshable views also require access to `system.view_refreshes` and the `SYSTEM VIEWS` privilege for stopping and starting their schedules. Cancellation needs permission to stop its own query. Scope grants to the intended database.
 
 ## Development
 
 `apps/backend/src/app.ts` assembles Fastify; `server.ts` starts it. The `connections`, `clickhouse`, `backups`, `restores`, and `jobs` modules contain functions independent of HTTP. `error-handler.ts` handles request errors centrally; job failures and resource cleanup are handled where those operations run. `apps/frontend/` is reserved for React.
+
+Restore coordinators keep the operation order explicit. Schema discovery and SQL checks belong to `clickhouse`; `restores/views.ts` manages view lifecycles; `restores/load.ts` only clears and imports physical tables. Both restore modes use the same data-loading functions and persistent job journal.
+
+```text
+HTTP API -> Jobs and journal
+              |-> Backup:  schema checks -> Native export -> .chbackup
+              |-> Restore: archive/schema checks -> prepare views
+                           -> Native import -> create/attach views -> resume schedules
+```
 
 From `apps/backend`:
 
@@ -137,4 +150,4 @@ npm test
 npm run build
 ```
 
-The three e2e scenarios in `tests/e2e/` cover file backup and independent restores after source profile deletion, data replacement including computed columns and aggregates, and rejection of damaged files or schema mismatches before destination changes. They use real HTTP requests and temporary ClickHouse servers with isolated ports and directories. Running them requires the local `clickhouse` binary with `server` and `client` subcommands; existing databases are not used.
+The four e2e scenarios in `tests/e2e/` cover file backup and independent restores after source profile deletion; data replacement including computed columns, aggregates, refresh schedules and APPEND snapshots; rejection of damaged files or schema mismatches before destination changes; and cancellation, failure and journal-based recovery. They use real HTTP requests and temporary ClickHouse servers with isolated ports and directories. Running them requires the local `clickhouse` binary with `server` and `client` subcommands; existing databases are not used.

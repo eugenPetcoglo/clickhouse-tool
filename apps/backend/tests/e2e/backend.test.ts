@@ -9,7 +9,7 @@ import type { BackupSummary } from '../../src/backups/types.js';
 import { createClickHouseClient } from '../../src/clickhouse/client.js';
 import { loadConfig } from '../../src/config.js';
 import type { Job } from '../../src/jobs/types.js';
-import type { ClickHouseClient, ConnectedConnection, ConnectionProfile, RestoreMode } from '../../src/types.js';
+import type { ClickHouseClient, ConnectedConnection, ConnectionProfile, OperationContext, RestoreMode } from '../../src/types.js';
 import { startTestServer, type TestServer } from './server.js';
 
 let directory: string;
@@ -24,6 +24,8 @@ let database: string;
 let sourceProfile: ConnectionProfile;
 let targetProfile: ConnectionProfile;
 let backup: BackupSummary;
+let afterImport: ((context: OperationContext) => Promise<void>) | undefined;
+let beforeExecute: ((sql: string) => Promise<void>) | undefined;
 
 async function json<T>(method: string, path: string, body?: unknown, status = 200): Promise<T> {
   const response = await fetch(`${baseUrl}/api${path}`, {
@@ -73,6 +75,28 @@ async function total(connection: ConnectedConnection): Promise<number> {
   return Number(result[0]!.total);
 }
 
+async function refreshStates(connection: ConnectedConnection): Promise<Record<string, string>> {
+  const views = await client.query<{ view: string; status: string }>(connection,
+    'SELECT view, status FROM system.view_refreshes WHERE database = {database:String} ORDER BY view',
+    { parameters: { database } });
+  expect(views.map(view => view.view)).toEqual(['append_mv', 'refresh_mv']);
+  return Object.fromEntries(views.map(view => [view.view, view.status]));
+}
+
+async function expectSavedRefreshData(connection: ConnectedConnection): Promise<void> {
+  expect(await client.query(connection, `SELECT id, value FROM ${database}.refreshed ORDER BY id`)).toEqual([{ id: 90, value: 900 }]);
+  expect(await client.query(connection, `SELECT id, value FROM ${database}.appended ORDER BY id`)).toEqual([{ id: 80, value: 800 }]);
+}
+
+async function waitForRunningRefresh(): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if ((await refreshStates(target)).refresh_mv === 'Running') return;
+    await delay(25);
+  }
+  throw new Error('The refresh did not start.');
+}
+
 const expectedRows = [{ id: 1, value: 7, computed: 999 }, { id: 2, value: 8, computed: 888 }];
 
 beforeAll(async () => {
@@ -89,7 +113,19 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   database = `tool_e2e_${randomUUID().replaceAll('-', '')}`;
-  app = await createApp(loadConfig({ DATA_DIR: join(directory, database) }));
+  afterImport = undefined;
+  beforeExecute = undefined;
+  app = await createApp(loadConfig({ DATA_DIR: join(directory, database) }), { client: {
+    ...client,
+    async execute(connection, sql, options) {
+      await beforeExecute?.(sql);
+      await client.execute(connection, sql, options);
+    },
+    async importTable(connection, database, table, input, context) {
+      await client.importTable(connection, database, table, input, context);
+      await afterImport?.(context);
+    },
+  } });
   baseUrl = await app.listen({ host: '127.0.0.1', port: 0 });
   sourceProfile = await connect(sourceServer.port);
   targetProfile = await connect(targetServer.port);
@@ -100,6 +136,17 @@ beforeEach(async () => {
   await client.execute(source, `CREATE MATERIALIZED VIEW ${database}.mv TO ${database}.agg AS SELECT sumState(value) AS total FROM ${database}.raw`);
   await client.execute(source, `CREATE VIEW ${database}.v AS SELECT id, value FROM ${database}.raw`);
   await client.execute(source, `INSERT INTO ${database}.raw (id, value, computed) SETTINGS insert_allow_materialized_columns=1 VALUES (1, 7, 999), (2, 8, 888)`);
+  await client.execute(source, `CREATE TABLE ${database}.refreshed (id UInt32, value UInt32) ENGINE = MergeTree ORDER BY id`);
+  await client.execute(source, `CREATE TABLE ${database}.appended (id UInt32, value UInt32) ENGINE = MergeTree ORDER BY id`);
+  await client.execute(source, `CREATE MATERIALIZED VIEW ${database}.refresh_mv REFRESH EVERY 1 DAY TO ${database}.refreshed EMPTY AS
+    SELECT id, value FROM (SELECT id, value FROM ${database}.v UNION ALL SELECT id, value FROM ${database}.raw WHERE id = 0)
+    WHERE sleepEachRow(0.01) = 0`);
+  await client.execute(source, `CREATE MATERIALIZED VIEW ${database}.append_mv REFRESH AFTER 1 DAY DEPENDS ON ${database}.refresh_mv APPEND TO ${database}.appended EMPTY AS SELECT id, value FROM ${database}.refreshed`);
+  await client.execute(source, `SYSTEM STOP VIEW ${database}.refresh_mv`);
+  await client.execute(source, `SYSTEM STOP VIEW ${database}.append_mv`);
+  // Stored snapshots deliberately differ from the SELECT results, exposing an accidental refresh.
+  await client.execute(source, `INSERT INTO ${database}.refreshed VALUES (90, 900)`);
+  await client.execute(source, `INSERT INTO ${database}.appended VALUES (80, 800)`);
   backup = (await runJob('/backups', { sourceConnectionId: sourceProfile.id, database })).result as BackupSummary;
 });
 
@@ -132,28 +179,40 @@ it('backs up to a file and restores it to independent destinations after deletin
   await restore('create-new', targetProfile.id, imported.backup.id);
   expect(await rows(target)).toEqual(expectedRows);
   expect(await total(target)).toBe(15);
+  await expectSavedRefreshData(target);
+  expect(Object.values(await refreshStates(target))).not.toContain('Disabled');
 
   await client.execute(source, `DROP DATABASE ${database} SYNC`);
   const anotherTarget = await connect(sourceServer.port);
   await restore('create-new', anotherTarget.id, imported.backup.id);
   expect(await rows(source)).toEqual(expectedRows);
   expect(await total(source)).toBe(15);
+  await expectSavedRefreshData(source);
 });
 
 it('replaces data, clears empty tables and restores aggregates without double filling', async () => {
   await restore('create-new');
   await client.execute(target, `INSERT INTO ${database}.raw (id, value) VALUES (99, 1000)`);
   await client.execute(target, `INSERT INTO ${database}.empty VALUES (99)`);
+  await client.execute(target, `SYSTEM STOP VIEW ${database}.append_mv`);
   await restore('replace-data');
   expect(await rows(target)).toEqual(expectedRows);
   expect(await total(target)).toBe(15);
   expect(await client.query(target, `SELECT * FROM ${database}.empty`)).toEqual([]);
   expect(await client.query(target, `SELECT id FROM ${database}.v ORDER BY id`)).toEqual([{ id: 1 }, { id: 2 }]);
+  await expectSavedRefreshData(target);
+  const states = await refreshStates(target);
+  expect(states.refresh_mv).not.toBe('Disabled');
+  expect(states.append_mv).toBe('Disabled');
+  await client.execute(target, `SYSTEM REFRESH VIEW ${database}.refresh_mv`);
+  await client.execute(target, `SYSTEM WAIT VIEW ${database}.refresh_mv`);
+  expect(await client.query(target, `SELECT id, value FROM ${database}.refreshed ORDER BY id`)).toEqual([{ id: 1, value: 7 }, { id: 2, value: 8 }]);
+  await expect(client.query(target, `SELECT id, value FROM ${database}.appended ORDER BY id`)).resolves.toEqual([{ id: 80, value: 800 }]);
   await client.execute(target, `INSERT INTO ${database}.raw (id, value) VALUES (3, 3)`);
   expect(await total(target)).toBe(18);
 });
 
-it('rejects a damaged backup and a schema mismatch before changing destination data', async () => {
+it('rejects damaged backups, unsupported materialized views and schema mismatches before changing destination data', async () => {
   await restore('create-new');
   const original = await readFile(backup.path);
   await writeFile(backup.path, original.subarray(0, original.length - 50));
@@ -166,8 +225,21 @@ it('rejects a damaged backup and a schema mismatch before changing destination d
   expect(blocked.error.code).toBe('RESTORE_CHECK_REQUIRED');
   expect(await rows(target)).toEqual(expectedRows);
   expect(await total(target)).toBe(15);
+  await expectSavedRefreshData(target);
 
   await writeFile(backup.path, original);
+  await client.execute(source, `CREATE TABLE ${database}.cursor_raw (id UInt32, value UInt32) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1`);
+  await client.execute(source, `CREATE MATERIALIZED VIEW ${database}.cursor_mv REFRESH AFTER 1 DAY APPEND INCREMENTAL TO ${database}.appended EMPTY AS SELECT id, value FROM ${database}.cursor_raw`);
+  const cursorBackup = await json<{ jobId: string }>('POST', '/backups', { sourceConnectionId: sourceProfile.id, database }, 202);
+  expect((await waitForJob(cursorBackup.jobId)).error?.code).toBe('UNSUPPORTED_SCHEMA');
+  await client.execute(source, `DROP TABLE ${database}.cursor_mv SYNC`);
+  await client.execute(source, `DROP TABLE ${database}.cursor_raw SYNC`);
+
+  await client.execute(source, `CREATE MATERIALIZED VIEW ${database}.hidden_mv ENGINE = MergeTree ORDER BY id AS SELECT id FROM ${database}.raw`);
+  const hiddenBackup = await json<{ jobId: string }>('POST', '/backups', { sourceConnectionId: sourceProfile.id, database }, 202);
+  expect((await waitForJob(hiddenBackup.jobId)).error?.code).toBe('UNSUPPORTED_SCHEMA');
+  await client.execute(source, `DROP TABLE ${database}.hidden_mv SYNC`);
+
   await client.execute(target, `ALTER TABLE ${database}.raw ADD COLUMN extra UInt8`);
   const mismatch = await json<{ jobId: string }>('POST', '/restores/check', request, 202);
   const failed = await waitForJob(mismatch.jobId);
@@ -175,4 +247,89 @@ it('rejects a damaged backup and a schema mismatch before changing destination d
   expect(failed.changes).toEqual([]);
   expect(await rows(target)).toEqual(expectedRows);
   expect(await total(target)).toBe(15);
+  await expectSavedRefreshData(target);
+});
+
+it('keeps refreshes stopped after cancellation and failure, then recovers the original schedule state', async () => {
+  afterImport = async () => { throw new Error('Controlled new database import failure'); };
+  const creationCheck = await runJob('/restores/check', { backupId: backup.id, targetConnectionId: targetProfile.id, mode: 'create-new' });
+  const creation = await json<{ jobId: string }>('POST', '/restores', {
+    checkJobId: creationCheck.id, confirmationName: database, targetWritesPaused: true,
+  }, 202);
+  const failedCreation = await waitForJob(creation.jobId);
+  expect(failedCreation.status).toBe('failed');
+  expect(failedCreation.error?.message).toContain('Controlled new database import failure');
+  expect(failedCreation.requiresRecovery).toBe(true);
+  expect(await client.query(target,
+    'SELECT name FROM system.tables WHERE database = {database:String} AND engine = \'MaterializedView\'',
+    { parameters: { database } })).toEqual([]);
+
+  afterImport = undefined;
+  const creationRecovery = await runJob('/restores/check', {
+    backupId: backup.id, targetConnectionId: targetProfile.id, mode: 'create-new', recoveryJobId: failedCreation.id,
+  });
+  await runJob('/restores', { checkJobId: creationRecovery.id, confirmationName: database, targetWritesPaused: true });
+  await expectSavedRefreshData(target);
+  expect(Object.values(await refreshStates(target))).not.toContain('Disabled');
+  await client.execute(target, `SYSTEM STOP VIEW ${database}.append_mv`);
+  await client.execute(target, `INSERT INTO ${database}.raw (id, value) SELECT toUInt32(number + 100), toUInt32(number) FROM numbers(250)`);
+
+  const request = { backupId: backup.id, targetConnectionId: targetProfile.id, mode: 'replace-data' };
+  const check = await runJob('/restores/check', request);
+  let importReached: () => void = () => {};
+  const imported = new Promise<void>(resolve => { importReached = resolve; });
+  afterImport = async context => {
+    expect(Object.values(await refreshStates(target))).toEqual(['Disabled', 'Disabled']);
+    importReached();
+    await delay(60_000, undefined, { signal: context.signal });
+  };
+  let observedRunningRefresh = false;
+  let checkedTruncations = 0;
+  beforeExecute = async sql => {
+    if (!observedRunningRefresh && sql.startsWith('SYSTEM STOP VIEW ') && sql.includes('refresh_mv')) {
+      // Start just before STOP reaches the server, so a slow preflight cannot make this check vacuous.
+      await client.execute(target, `SYSTEM REFRESH VIEW ${database}.refresh_mv`);
+      await waitForRunningRefresh();
+      observedRunningRefresh = true;
+    }
+    if (sql.startsWith('TRUNCATE TABLE ')) {
+      expect(observedRunningRefresh).toBe(true);
+      expect(Object.values(await refreshStates(target))).toEqual(['Disabled', 'Disabled']);
+      checkedTruncations++;
+    }
+  };
+  const { jobId } = await json<{ jobId: string }>('POST', '/restores', {
+    checkJobId: check.id, confirmationName: database, targetWritesPaused: true,
+  }, 202);
+  await Promise.race([imported, waitForJob(jobId).then(job => { throw new Error(job.error?.message ?? 'Restore ended before the import was paused.'); })]);
+  await json('POST', `/jobs/${jobId}/cancel`);
+  const cancelled = await waitForJob(jobId);
+  expect(cancelled.status).toBe('cancelled');
+  expect(cancelled.requiresRecovery).toBe(true);
+  expect(observedRunningRefresh).toBe(true);
+  expect(checkedTruncations).toBeGreaterThan(0);
+  expect(Object.values(await refreshStates(target))).toEqual(['Disabled', 'Disabled']);
+  expect(await rows(target)).toEqual([]);
+
+  beforeExecute = undefined;
+  afterImport = async () => { throw new Error('Controlled import failure'); };
+  const retryCheck = await runJob('/restores/check', { ...request, recoveryJobId: cancelled.id });
+  const retry = await json<{ jobId: string }>('POST', '/restores', {
+    checkJobId: retryCheck.id, confirmationName: database, targetWritesPaused: true,
+  }, 202);
+  const failed = await waitForJob(retry.jobId);
+  expect(failed.status).toBe('failed');
+  expect(failed.error?.message).toContain('Controlled import failure');
+  expect(failed.requiresRecovery).toBe(true);
+  expect(Object.values(await refreshStates(target))).toEqual(['Disabled', 'Disabled']);
+
+  afterImport = undefined;
+  const finalCheck = await runJob('/restores/check', { ...request, recoveryJobId: failed.id });
+  await runJob('/restores', { checkJobId: finalCheck.id, confirmationName: database, targetWritesPaused: true });
+  expect(await rows(target)).toEqual(expectedRows);
+  expect(await total(target)).toBe(15);
+  await expectSavedRefreshData(target);
+  const states = await refreshStates(target);
+  expect(states.refresh_mv).not.toBe('Disabled');
+  expect(states.append_mv).toBe('Disabled');
 });
