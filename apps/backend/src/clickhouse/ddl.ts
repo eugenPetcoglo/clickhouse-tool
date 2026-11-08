@@ -57,7 +57,8 @@ export async function checkParsedCreateStatements(client: ClickHouseClient, targ
   const definitions = [{ ddl: schema.ddl, dependencies: [] as string[], targetTable: undefined as string | undefined }, ...schema.objects];
   for (const definition of definitions) {
     const referenced = await readSqlDependencies(client, target, schema, definition.ddl, context);
-    const declared = new Set(definition.dependencies.filter(name => name !== definition.targetTable));
+    const viewTarget = 'kind' in definition && definition.kind === 'materialized-view' ? definition.targetTable : undefined;
+    const declared = new Set(definition.dependencies.filter(name => name !== viewTarget));
     if (JSON.stringify(referenced) !== JSON.stringify([...declared].sort())) {
       const label = 'name' in definition ? String(definition.name) : schema.name;
       throw new AppError('INVALID_BACKUP_SQL', `Saved SQL dependencies for ${label} differ from the backup metadata (SQL: ${referenced.join(', ')}; metadata: ${[...declared].sort().join(', ')}).`, 422);
@@ -67,6 +68,9 @@ export async function checkParsedCreateStatements(client: ClickHouseClient, targ
 
 /** Metadata reads can retain missing local view names for journal-based recovery. */
 export async function readSqlDependencies(client: ClickHouseClient, target: ConnectedConnection, schema: DatabaseSchema, ddl: string, context?: OperationContext, allowUnresolvedLocal = false): Promise<string[]> {
+    if ([schema.name, ...schema.objects.map(object => object.name)].some(name => name.includes(' (alias '))) {
+      throw new AppError('UNSUPPORTED_SCHEMA', 'Database and object names containing " (alias " cannot be distinguished safely from ClickHouse syntax-tree alias annotations.');
+    }
     checkSingleStatement(ddl);
     const rows = await client.query<{ explain: string }>(target, `EXPLAIN AST ${ddl.trim().replace(/;$/, '')}`, { context, signal: context?.signal });
     const lines = rows.flatMap(row => {
@@ -96,6 +100,22 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
     }
     function visit(node: AstNode): void {
       const line = node.text;
+      if (line.startsWith('Storage definition ')) {
+        const buffer = node.children.find(child => /^Function Buffer(?: |$)/i.test(child.text));
+        if (buffer) {
+          const argumentsList = buffer.children[0]?.children ?? [];
+          const database = readBufferArgument(argumentsList[0]);
+          const table = readBufferArgument(argumentsList[1]);
+          if (!database || database !== schema.name || !table) {
+            throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer tables must write to a table in the same database.');
+          }
+          const destination = schema.objects.find(object => object.name === table);
+          if (!destination || destination.kind !== 'table' || destination.engine === 'Buffer') {
+            throw new AppError('UNSUPPORTED_SCHEMA', `Buffer destination ${table} must be a supported persistent table, without Buffer chains.`);
+          }
+          reference(`${database}.${table}`);
+        }
+      }
       if (line.startsWith('TableExpression ')) {
         const child = node.children[0]?.text ?? '';
         if (!child.startsWith('TableIdentifier ') && !child.startsWith('Subquery ')) {
@@ -113,7 +133,11 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
         // ClickHouse dumps `x IN db.table` as Identifier, not TableIdentifier.
         if (rightArgument?.startsWith('Identifier ')) reference(rightArgument.slice('Identifier '.length));
       }
-      if (line.startsWith('TableIdentifier ')) reference(line.slice('TableIdentifier '.length));
+      if (line.startsWith('TableIdentifier ')) {
+        const identifier = line.slice('TableIdentifier '.length);
+        const alias = identifier.indexOf(' (alias ');
+        reference(alias < 0 ? identifier : identifier.slice(0, alias));
+      }
       node.children.forEach(visit);
     }
     astTree(lines).forEach(visit);
@@ -121,6 +145,20 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
 }
 
 interface AstNode { text: string; children: AstNode[] }
+
+function readBufferArgument(node: AstNode | undefined): string {
+  if (node?.text.startsWith('Identifier ')) return node.text.slice('Identifier '.length);
+  const literal = node?.text.match(/^Literal '((?:[^'\\]|\\.|'')*)'$/s);
+  if (!literal) throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer destination arguments must be saved as database and table names, without expressions.');
+  return literal[1]!.replace(/''|\\(?:x[\da-fA-F]{2}|.)/gs, escape => {
+    if (escape === "''") return "'";
+    if (escape.startsWith('\\x')) return String.fromCharCode(Number.parseInt(escape.slice(2), 16));
+    const character = escape[1]!;
+    const decoded = ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '0': '\0', '\\': '\\', "'": "'", '"': '"' })[character];
+    if (decoded === undefined) throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer destination names contain an unsupported escape sequence.');
+    return decoded;
+  });
+}
 
 function astTree(lines: string[]): AstNode[] {
   const roots: AstNode[] = [];

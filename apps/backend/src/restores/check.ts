@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { checkBackup } from '../backups/archive.js';
-import { getDataTables, orderViews, readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
+import { checkBufferVersion, getBufferTables, getCreateTables, getDataTables, orderViews, readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
 import { AppError } from '../errors.js';
 import type { DatabaseSchema, OperationContext, SchemaObject } from '../types.js';
 import { checkCreateStatements, checkParsedCreateStatements, isRefreshableView } from '../clickhouse/ddl.js';
@@ -39,6 +39,7 @@ export async function prepareRestore(input: RestoreInput, context?: OperationCon
     if (versionFamily(identity.version) !== versionFamily(sourceVersion)) {
       throw new AppError('VERSION_MISMATCH', 'Restore requires the same ClickHouse major/minor version as the backup.', 422);
     }
+    checkBufferVersion(schema, identity.version);
     await checkParsedCreateStatements(input.client, input.target, schema, context);
     if (schema.objects.some(isRefreshableView)) {
       // Check runtime metadata before creating a database or clearing any data.
@@ -97,6 +98,7 @@ export async function prepareRestore(input: RestoreInput, context?: OperationCon
       warnings: [
         'Pause application writes and migrations on the destination before restoring.',
         'Logical backups contain per-table snapshots. TTL and MergeTree merges still apply.',
+        ...(getBufferTables(schema).length ? ['Destination buffers are drained before tables are cleared. Saved buffer rows are restored directly into their durable target tables.'] : []),
         ...(schema.objects.some(isRefreshableView) ? ['Refresh schedules resume after loading. Scheduled refreshes can then update the restored data.'] : []),
         ...(detachedViews.length ? ['Detached view definitions will be temporarily attached, verified and detached again before any table is cleared.'] : []),
       ],
@@ -161,7 +163,7 @@ async function checkStoragePolicies(input: RestoreInput, schema: DatabaseSchema,
 function restoreActions(mode: RestoreInput['mode'], schema: DatabaseSchema, createDatabase: boolean, missing: SchemaObject[]): string[] {
   const actions: string[] = [];
   const missingNames = new Set(missing.map(object => object.name));
-  const tables = getDataTables(schema);
+  const tables = getCreateTables(schema);
   const views = orderViews(schema.objects);
   if (mode === 'create-new') {
     if (createDatabase) actions.push(`Create database ${schema.name}`);
@@ -172,7 +174,12 @@ function restoreActions(mode: RestoreInput['mode'], schema: DatabaseSchema, crea
       ? `Stop refreshable view ${view.name} and wait for its refresh to finish`
       : `Temporarily detach view ${view.name}`);
   }
-  for (const table of tables) actions.push(`Truncate and restore table ${table.name}`);
+  for (const buffer of getBufferTables(schema)) actions.push(`Drain buffer ${buffer.name} and wait for its queued writes before clearing targets`);
+  for (const table of tables) {
+    actions.push(table.engine === 'Buffer'
+      ? `Restore saved memory rows from buffer ${table.name} into table ${table.targetTable}`
+      : `Truncate and restore table ${table.name}`);
+  }
   for (const view of views) {
     if (missingNames.has(view.name)) {
       actions.push(isRefreshableView(view) ? `Create refreshable view ${view.name} without an initial refresh` : `Create ${view.kind} ${view.name}`);

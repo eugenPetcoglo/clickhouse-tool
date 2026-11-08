@@ -1,4 +1,4 @@
-import { getDataTables } from '../clickhouse/metadata.js';
+import { getCreateTables } from '../clickhouse/metadata.js';
 import { AppError, errorMessage } from '../errors.js';
 import type { OperationContext } from '../types.js';
 import { prepareRestore } from './check.js';
@@ -23,7 +23,7 @@ export async function restoreNewDatabase(input: RestoreInput, context: Operation
       await context.recordChange('create-database', schema.name, true);
     }
     const missingNames = new Set(prepared.missingObjects.map(object => object.name));
-    const tables = getDataTables(schema);
+    const tables = getCreateTables(schema);
     // Create views only after all saved data is in place.
     for (const object of tables) {
       if (!missingNames.has(object.name)) continue;
