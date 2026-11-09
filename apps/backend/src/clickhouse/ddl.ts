@@ -1,5 +1,42 @@
 import { AppError } from '../errors.js';
-import type { ClickHouseClient, ConnectedConnection, DatabaseSchema, OperationContext } from '../types.js';
+import type { ClickHouseClient, ConnectedConnection, DatabaseSchema, OperationContext, SchemaObject } from '../types.js';
+
+export function readViewHeader(ddl: string, database: string): { targetDatabase?: string; targetTable?: string; refreshable: boolean } {
+  const header = viewHeaderTokens(ddl);
+  const words = header.map(token => token.text.toUpperCase());
+  const refreshable = words[0] === 'REFRESH';
+  if (refreshable && words.some((word, index) => word === 'APPEND' && words[index + 1] === 'INCREMENTAL')) {
+    throw new AppError('UNSUPPORTED_SCHEMA', 'Refreshable materialized views using APPEND INCREMENTAL require cursor backups and are not supported.');
+  }
+  const target = targetClauseIndex(header);
+  const first = header[target + 1]?.text;
+  if (target < 0 || !first) return { refreshable };
+  if (header[target + 2]?.text === '.' && header[target + 3]) {
+    return { refreshable, targetDatabase: unquote(first), targetTable: unquote(header[target + 3]!.text) };
+  }
+  return { refreshable, targetDatabase: database, targetTable: unquote(first) };
+}
+
+export function isRefreshableView(object: SchemaObject): boolean {
+  return object.kind === 'materialized-view' && readViewHeader(object.ddl, '').refreshable;
+}
+
+/** Skip only the creation-time refresh; the saved definition and SELECT body stay unchanged. */
+export function createViewStatement(ddl: string): string {
+  if (!readViewHeader(ddl, '').refreshable) return ddl;
+  const tokens = viewHeaderTokens(ddl);
+  const select = tokens.findIndex(token => token.text.toUpperCase() === 'AS');
+  if (select < 0) invalidSql();
+  const target = targetClauseIndex(tokens);
+  if (target < 0) invalidSql();
+  const targetEnd = tokens[target + 2]?.text === '.' ? target + 4 : target + 2;
+  const clauses = tokens.slice(targetEnd, select);
+  const empty = clauses.some((token, index) => token.text.toUpperCase() === 'EMPTY'
+    && !['.', '='].includes(clauses[index - 1]?.text ?? '') && clauses[index + 1]?.text !== '=');
+  if (empty) return ddl;
+  const offset = tokens[select]!.offset;
+  return `${ddl.slice(0, offset)}EMPTY ${ddl.slice(offset)}`;
+}
 
 /** Check a saved CREATE statement's destination; this does not rewrite SQL. */
 export function checkCreateStatements(schema: DatabaseSchema): void {
@@ -20,7 +57,8 @@ export async function checkParsedCreateStatements(client: ClickHouseClient, targ
   const definitions = [{ ddl: schema.ddl, dependencies: [] as string[], targetTable: undefined as string | undefined }, ...schema.objects];
   for (const definition of definitions) {
     const referenced = await readSqlDependencies(client, target, schema, definition.ddl, context);
-    const declared = new Set(definition.dependencies.filter(name => name !== definition.targetTable));
+    const viewTarget = 'kind' in definition && definition.kind === 'materialized-view' ? definition.targetTable : undefined;
+    const declared = new Set(definition.dependencies.filter(name => name !== viewTarget));
     if (JSON.stringify(referenced) !== JSON.stringify([...declared].sort())) {
       const label = 'name' in definition ? String(definition.name) : schema.name;
       throw new AppError('INVALID_BACKUP_SQL', `Saved SQL dependencies for ${label} differ from the backup metadata (SQL: ${referenced.join(', ')}; metadata: ${[...declared].sort().join(', ')}).`, 422);
@@ -30,6 +68,9 @@ export async function checkParsedCreateStatements(client: ClickHouseClient, targ
 
 /** Metadata reads can retain missing local view names for journal-based recovery. */
 export async function readSqlDependencies(client: ClickHouseClient, target: ConnectedConnection, schema: DatabaseSchema, ddl: string, context?: OperationContext, allowUnresolvedLocal = false): Promise<string[]> {
+    if ([schema.name, ...schema.objects.map(object => object.name)].some(name => name.includes(' (alias '))) {
+      throw new AppError('UNSUPPORTED_SCHEMA', 'Database and object names containing " (alias " cannot be distinguished safely from ClickHouse syntax-tree alias annotations.');
+    }
     checkSingleStatement(ddl);
     const rows = await client.query<{ explain: string }>(target, `EXPLAIN AST ${ddl.trim().replace(/;$/, '')}`, { context, signal: context?.signal });
     const lines = rows.flatMap(row => {
@@ -59,6 +100,22 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
     }
     function visit(node: AstNode): void {
       const line = node.text;
+      if (line.startsWith('Storage definition ')) {
+        const buffer = node.children.find(child => /^Function Buffer(?: |$)/i.test(child.text));
+        if (buffer) {
+          const argumentsList = buffer.children[0]?.children ?? [];
+          const database = readBufferArgument(argumentsList[0]);
+          const table = readBufferArgument(argumentsList[1]);
+          if (!database || database !== schema.name || !table) {
+            throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer tables must write to a table in the same database.');
+          }
+          const destination = schema.objects.find(object => object.name === table);
+          if (!destination || destination.kind !== 'table' || destination.engine === 'Buffer') {
+            throw new AppError('UNSUPPORTED_SCHEMA', `Buffer destination ${table} must be a supported persistent table, without Buffer chains.`);
+          }
+          reference(`${database}.${table}`);
+        }
+      }
       if (line.startsWith('TableExpression ')) {
         const child = node.children[0]?.text ?? '';
         if (!child.startsWith('TableIdentifier ') && !child.startsWith('Subquery ')) {
@@ -76,7 +133,11 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
         // ClickHouse dumps `x IN db.table` as Identifier, not TableIdentifier.
         if (rightArgument?.startsWith('Identifier ')) reference(rightArgument.slice('Identifier '.length));
       }
-      if (line.startsWith('TableIdentifier ')) reference(line.slice('TableIdentifier '.length));
+      if (line.startsWith('TableIdentifier ')) {
+        const identifier = line.slice('TableIdentifier '.length);
+        const alias = identifier.indexOf(' (alias ');
+        reference(alias < 0 ? identifier : identifier.slice(0, alias));
+      }
       node.children.forEach(visit);
     }
     astTree(lines).forEach(visit);
@@ -84,6 +145,20 @@ export async function readSqlDependencies(client: ClickHouseClient, target: Conn
 }
 
 interface AstNode { text: string; children: AstNode[] }
+
+function readBufferArgument(node: AstNode | undefined): string {
+  if (node?.text.startsWith('Identifier ')) return node.text.slice('Identifier '.length);
+  const literal = node?.text.match(/^Literal '((?:[^'\\]|\\.|'')*)'$/s);
+  if (!literal) throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer destination arguments must be saved as database and table names, without expressions.');
+  return literal[1]!.replace(/''|\\(?:x[\da-fA-F]{2}|.)/gs, escape => {
+    if (escape === "''") return "'";
+    if (escape.startsWith('\\x')) return String.fromCharCode(Number.parseInt(escape.slice(2), 16));
+    const character = escape[1]!;
+    const decoded = ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', '0': '\0', '\\': '\\', "'": "'", '"': '"' })[character];
+    if (decoded === undefined) throw new AppError('UNSUPPORTED_SCHEMA', 'Buffer destination names contain an unsupported escape sequence.');
+    return decoded;
+  });
+}
 
 function astTree(lines: string[]): AstNode[] {
   const roots: AstNode[] = [];
@@ -102,51 +177,61 @@ function astTree(lines: string[]): AstNode[] {
 
 /** Metadata fields do not grant permission to execute a different SQL engine. */
 function checkDefinition(sql: string, expectedEngine: string): void {
-  const tokens = topLevelTokens(sql);
+  const tokens = topLevelTokens(sql).map(token => token.text.startsWith('`') || token.text.startsWith('"') ? token.text : token.text.toUpperCase());
   const engine = tokens.findIndex(token => token === 'ENGINE');
   if (engine < 0 || tokens[engine + 1] !== '=' || tokens[engine + 2] !== expectedEngine.toUpperCase()) invalidSql();
   if (tokens.includes('UUID') || tokens.includes('CLUSTER') || tokens.includes('AS')) invalidSql();
 }
 
 function checkViewDefinition(sql: string, database: string, targetTable?: string): void {
-  const tokens = topLevelTokens(sql);
+  const view = readViewHeader(sql, database);
+  const tokens = topLevelTokens(sql).map(token => token.text.startsWith('`') || token.text.startsWith('"') ? token.text : token.text.toUpperCase());
   const select = tokens.indexOf('AS');
   if (select < 0) invalidSql();
   const header = tokens.slice(0, select);
-  if (header.includes('UUID') || header.includes('CLUSTER') || header.includes('REFRESH') || header.includes('POPULATE')) invalidSql();
-  if (targetTable) {
-    const target = header.indexOf('TO');
-    if (target < 0) invalidSql();
-    const first = header[target + 1];
-    const second = header[target + 2];
-    if (second === '.') {
-      if (!identifierMatches(first, database) || !identifierMatches(header[target + 3], targetTable)) invalidSql();
-    } else if (!identifierMatches(first, targetTable)) invalidSql();
-  }
+  if (header.includes('UUID') || header.includes('CLUSTER') || header.includes('POPULATE')) invalidSql();
+  if (view.refreshable && !targetTable) invalidSql();
+  if (targetTable && (view.targetDatabase !== database || view.targetTable !== targetTable)) invalidSql();
 }
 
-function topLevelTokens(sql: string): string[] {
-  const tokens = sql.match(/--[^\n]*|\/\*[\s\S]*?\*\/|`(?:\\.|``|[^`])*`|"(?:\\.|""|[^"])*"|'(?:\\.|''|[^'])*'|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g) ?? [];
-  const result: string[] = [];
+function topLevelTokens(sql: string): Array<{ text: string; offset: number }> {
+  const tokens = sql.matchAll(/--[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|`(?:\\.|``|[^`])*`|"(?:\\.|""|[^"])*"|'(?:\\.|''|[^'])*'|[A-Za-z_][A-Za-z0-9_$]*|[^\s]/g);
+  const result: Array<{ text: string; offset: number }> = [];
   let depth = 0;
-  for (const token of tokens) {
-    if (token.startsWith('--') || token.startsWith('/*') || token.startsWith("'")) continue;
+  for (const match of tokens) {
+    const token = match[0];
+    if (token.startsWith('--') || token.startsWith('#') || token.startsWith('/*') || token.startsWith("'")) continue;
     if (token === '(') { depth++; continue; }
     if (token === ')') { depth--; if (depth < 0) invalidSql(); continue; }
     if (depth !== 0) continue;
-    result.push(token.startsWith('`') || token.startsWith('"') ? token : token.toUpperCase());
+    result.push({ text: token, offset: match.index });
   }
   if (depth !== 0) invalidSql();
   return result;
 }
 
-function identifierMatches(token: string | undefined, expected: string): boolean {
-  if (token === undefined) return false;
-  if (token.startsWith('`') || token.startsWith('"')) {
-    return token.slice(1, -1).replace(/\\(.)/gs, '$1').replaceAll(token[0]! + token[0]!, token[0]!) === expected;
-  }
-  // Unquoted SQL identifiers preserve case. Match the parser's uppercase token.
-  return token === expected.toUpperCase();
+/** Skip the CREATE object name so identifiers such as db.refresh are not clauses. */
+function viewHeaderTokens(sql: string): Array<{ text: string; offset: number }> {
+  const tokens = topLevelTokens(sql);
+  const view = tokens[1]?.text.toUpperCase() === 'MATERIALIZED' ? 2 : 1;
+  if (tokens[0]?.text.toUpperCase() !== 'CREATE' || tokens[view]?.text.toUpperCase() !== 'VIEW') return [];
+  let start = view + 1;
+  if (tokens[start]?.text.toUpperCase() === 'IF') start += 3;
+  start++;
+  if (tokens[start]?.text === '.') start += 2;
+  const select = tokens.findIndex((token, index) => index >= start && token.text.toUpperCase() === 'AS');
+  return tokens.slice(start, select < 0 ? undefined : select + 1);
+}
+
+function targetClauseIndex(tokens: Array<{ text: string }>): number {
+  return tokens.findIndex((token, index) => token.text.toUpperCase() === 'TO'
+    && !['.', 'ON', ','].includes(tokens[index - 1]?.text.toUpperCase() ?? ''));
+}
+
+function unquote(token: string): string {
+  if (!token.startsWith('`') && !token.startsWith('"')) return token;
+  const quote = token[0]!;
+  return token.slice(1, -1).replaceAll(quote + quote, quote).replace(/\\(.)/gs, (_match, character: string) => ({ n: '\n', r: '\r', t: '\t' })[character] ?? character);
 }
 
 function checkHeader(sql: string, words: string[], expectedName: string[]): void {

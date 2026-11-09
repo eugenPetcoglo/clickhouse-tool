@@ -173,10 +173,13 @@ export function createClickHouseClient(config: Config): ClickHouseClient {
     async exportTable(connection, database, table, output, context) {
       const columns = storedColumns(table);
       if (!columns.length) throw new AppError('UNSUPPORTED_SCHEMA', `Table ${table.name} has no stored columns.`);
-      const sql = `SELECT ${columns.map(quoteIdentifier).join(', ')} FROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)} FORMAT Native`;
+      // Buffer SELECT also reads its destination. Export only its in-memory rows.
+      const bufferFilter = table.engine === 'Buffer' ? ' WHERE _table = {bufferTable:String}' : '';
+      const sql = `SELECT ${columns.map(quoteIdentifier).join(', ')} FROM ${quoteIdentifier(database)}.${quoteIdentifier(table.name)}${bufferFilter} FORMAT Native`;
       const counter = new Transform({ transform(chunk: Buffer, _encoding, callback) { context.addBytes(chunk.length); callback(null, chunk); } });
       const writing = pipeline(counter, output);
-      const exporting = run(connection, sql, { context }, { output: counter }, 0).catch(error => {
+      const options = { context, ...(table.engine === 'Buffer' ? { parameters: { bufferTable: table.name } } : {}) };
+      const exporting = run(connection, sql, options, { output: counter }, 0).catch(error => {
         counter.destroy(error instanceof Error ? error : new Error(String(error)));
         throw error;
       });

@@ -1,28 +1,33 @@
 import type { CheckedBackup } from '../backups/archive.js';
 import { quoteIdentifier } from '../clickhouse/client.js';
-import { orderViews } from '../clickhouse/metadata.js';
+import { getBufferTables, getCreateTables } from '../clickhouse/metadata.js';
+import { AppError } from '../errors.js';
 import type { OperationContext } from '../types.js';
-import type { RestoreInput, RestoreResult } from './types.js';
+import type { RestoreInput } from './types.js';
 
-/** Both restore modes use exactly the same data path once an empty compatible schema exists. */
-export async function loadBackupData(input: RestoreInput, backup: CheckedBackup, detachedViews: string[], context: OperationContext): Promise<RestoreResult> {
+/** Call only after views are disabled and all physical tables exist. */
+export async function loadBackupData(input: RestoreInput, backup: CheckedBackup, context: OperationContext): Promise<void> {
   const database = backup.schema.name;
-  const views = orderViews(backup.schema.objects);
-  const tables = backup.schema.objects.filter(object => object.kind === 'table').sort((left, right) => left.name.localeCompare(right.name));
+  const tables = getCreateTables(backup.schema);
   const options = { context, signal: context.signal };
 
-  // Keep triggers disabled until ALL raw and aggregated tables have been imported.
-  for (const view of [...views].reverse()) {
+  // Buffer cannot be truncated. Drain old queued rows before clearing targets.
+  // Reading its RAM rows also waits for a flush that was already in progress.
+  for (const buffer of getBufferTables(backup.schema)) {
     context.signal.throwIfAborted();
-    await context.setPhase('detaching-views', view.name);
-    if (!detachedViews.includes(view.name)) {
-      await context.recordChange('detach-view', view.name);
-      await input.client.execute(input.target, `DETACH TABLE ${quoteIdentifier(database)}.${quoteIdentifier(view.name)} PERMANENTLY SYNC`, options);
+    await context.setPhase('draining-buffers', buffer.name);
+    await context.recordChange('flush-buffer', buffer.name);
+    await input.client.execute(input.target, `OPTIMIZE TABLE ${quoteIdentifier(database)}.${quoteIdentifier(buffer.name)}`, options);
+    const [row] = await input.client.query<{ rows: string }>(input.target,
+      `SELECT toString(count()) AS rows FROM ${quoteIdentifier(database)}.${quoteIdentifier(buffer.name)} WHERE _table = {bufferTable:String} SETTINGS optimize_trivial_count_query=0`,
+      { ...options, parameters: { bufferTable: buffer.name } });
+    if (row?.rows !== '0') {
+      throw new AppError('BUFFER_NOT_EMPTY', `Buffer table ${buffer.name} still contains queued rows. Keep destination writes paused before retrying.`, 409);
     }
-    await context.recordChange('detach-view', view.name, true);
+    await context.recordChange('flush-buffer', buffer.name, true);
   }
 
-  for (const table of tables) {
+  for (const table of tables.filter(table => table.engine !== 'Buffer')) {
     context.signal.throwIfAborted();
     await context.setPhase('clearing-tables', table.name);
     await context.recordChange('truncate-table', table.name);
@@ -44,21 +49,13 @@ export async function loadBackupData(input: RestoreInput, backup: CheckedBackup,
     }
     const stream = await backup.readData(table.id);
     try {
-      await input.client.importTable(input.target, database, table, stream, context);
+      // Keep saved RAM rows durable instead of restoring volatile Buffer state.
+      const destination = table.engine === 'Buffer' ? { ...table, name: table.targetTable! } : table;
+      await input.client.importTable(input.target, database, destination, stream, context);
     } finally {
       stream.destroy();
     }
     await context.recordChange('import-table', table.name, true);
     await context.completeObject?.(table.name);
   }
-
-  for (const view of views) {
-    context.signal.throwIfAborted();
-    await context.setPhase('attaching-views', view.name);
-    await context.recordChange('attach-view', view.name);
-    await input.client.execute(input.target, `ATTACH TABLE ${quoteIdentifier(database)}.${quoteIdentifier(view.name)}`, options);
-    await context.recordChange('attach-view', view.name, true);
-  }
-  await context.setPhase('completed');
-  return { database, mode: input.mode, tablesRestored: tables.length, viewsRestored: views.length };
 }

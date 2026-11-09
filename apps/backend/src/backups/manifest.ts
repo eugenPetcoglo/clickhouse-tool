@@ -1,6 +1,7 @@
 import { Type } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { AppError } from '../errors.js';
+import { getDataTables } from '../clickhouse/metadata.js';
 import type { Manifest } from './types.js';
 
 const uuid = Type.String({ pattern: '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$' });
@@ -69,7 +70,7 @@ export function parseManifest(content: string): Manifest {
   if (new Set(ids).size !== ids.length || new Set(names).size !== names.length) {
     throw new AppError('INVALID_BACKUP', 'Backup contains duplicate objects.', 422);
   }
-  const tableIds = manifest.schema.objects.filter(item => item.kind === 'table').map(item => item.id).sort();
+  const tableIds = getDataTables(manifest.schema).map(item => item.id).sort();
   const exports = manifest.tableExports.map(item => item.objectId).sort();
   if (JSON.stringify(tableIds) !== JSON.stringify(exports)) {
     throw new AppError('INVALID_BACKUP', 'Backup export records do not match its data tables.', 422);

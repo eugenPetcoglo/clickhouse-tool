@@ -1,13 +1,17 @@
 import { quoteIdentifier } from '../clickhouse/client.js';
+import { isRefreshableView } from '../clickhouse/ddl.js';
 import { orderViews, readDatabaseSchema, schemaFingerprint } from '../clickhouse/metadata.js';
 import { AppError } from '../errors.js';
 import type { DatabaseSchema, OperationContext } from '../types.js';
 import type { RestoreInput } from './types.js';
 
 /** Detached definitions cannot be read with SHOW CREATE. Verify them before clearing data. */
-export async function verifyDetachedViews(input: RestoreInput, schema: DatabaseSchema, detached: string[], context: OperationContext): Promise<void> {
+export async function verifyDetachedViews(input: RestoreInput, schema: DatabaseSchema, detached: string[], context: OperationContext, missingViews: string[] = []): Promise<void> {
   if (detached.length === 0) return;
   const views = orderViews(schema.objects).filter(view => detached.includes(view.name));
+  if (views.some(isRefreshableView)) {
+    throw new AppError('UNSAFE_VIEW_RECOVERY', 'A refreshable view is detached. Reattaching it can replay saved data; inspect the destination before retrying.', 409);
+  }
   const attached: string[] = [];
   try {
     for (const view of views) {
@@ -19,7 +23,8 @@ export async function verifyDetachedViews(input: RestoreInput, schema: DatabaseS
       await context.recordChange('attach-view', view.name, true);
     }
     const current = await readDatabaseSchema(input.client, input.target, schema.name, context);
-    if (schemaFingerprint(current) !== schemaFingerprint(schema)) {
+    const expected = { ...schema, objects: schema.objects.filter(object => !missingViews.includes(object.name)) };
+    if (schemaFingerprint(current) !== schemaFingerprint(expected)) {
       throw new AppError('SCHEMA_MISMATCH', 'Detached view definitions changed. Destination data was not cleared.', 422);
     }
   } finally {

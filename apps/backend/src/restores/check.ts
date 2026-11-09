@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { checkBackup } from '../backups/archive.js';
-import { readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
+import { checkBufferVersion, getBufferTables, getCreateTables, getDataTables, orderViews, readDatabaseSchema, schemaFingerprint, validateSupportedSchema } from '../clickhouse/metadata.js';
 import { AppError } from '../errors.js';
 import type { DatabaseSchema, OperationContext, SchemaObject } from '../types.js';
-import { checkCreateStatements, checkParsedCreateStatements } from '../clickhouse/ddl.js';
+import { checkCreateStatements, checkParsedCreateStatements, isRefreshableView } from '../clickhouse/ddl.js';
 import type { RestoreCheck, RestoreInput } from './types.js';
 
 export type { RestoreCheck, RestoreInput, RestoreRecovery } from './types.js';
@@ -39,7 +39,14 @@ export async function prepareRestore(input: RestoreInput, context?: OperationCon
     if (versionFamily(identity.version) !== versionFamily(sourceVersion)) {
       throw new AppError('VERSION_MISMATCH', 'Restore requires the same ClickHouse major/minor version as the backup.', 422);
     }
+    checkBufferVersion(schema, identity.version);
     await checkParsedCreateStatements(input.client, input.target, schema, context);
+    if (schema.objects.some(isRefreshableView)) {
+      // Check runtime metadata before creating a database or clearing any data.
+      await input.client.query(input.target,
+        'SELECT view, status FROM system.view_refreshes WHERE database = {database:String}',
+        { ...options, parameters: { database: schema.name } });
+    }
     const databases = await input.client.query<{ name: string }>(input.target,
       'SELECT name FROM system.databases WHERE name = {database:String}',
       { ...options, parameters: { database: schema.name } });
@@ -91,6 +98,8 @@ export async function prepareRestore(input: RestoreInput, context?: OperationCon
       warnings: [
         'Pause application writes and migrations on the destination before restoring.',
         'Logical backups contain per-table snapshots. TTL and MergeTree merges still apply.',
+        ...(getBufferTables(schema).length ? ['Destination buffers are drained before tables are cleared. Saved buffer rows are restored directly into their durable target tables.'] : []),
+        ...(schema.objects.some(isRefreshableView) ? ['Refresh schedules resume after loading. Scheduled refreshes can then update the restored data.'] : []),
         ...(detachedViews.length ? ['Detached view definitions will be temporarily attached, verified and detached again before any table is cleared.'] : []),
       ],
     };
@@ -125,7 +134,11 @@ async function readRecoverableViews(input: RestoreInput, schema: DatabaseSchema,
     { context, signal: context?.signal, parameters: { database: schema.name } });
   const viewNames = new Set(schema.objects.filter(object => object.kind !== 'table').map(object => object.name));
   const journalNames = new Set(input.recovery.changes.filter(change => change.action === 'detach-view').map(change => change.object));
-  return detached.filter(view => viewNames.has(view.name) && journalNames.has(view.name)).map(view => view.name);
+  const names = detached.filter(view => viewNames.has(view.name) && journalNames.has(view.name)).map(view => view.name);
+  if (schema.objects.some(object => names.includes(object.name) && isRefreshableView(object))) {
+    throw new AppError('UNSAFE_VIEW_RECOVERY', 'A refreshable view is detached. Reattaching it can replay saved data; inspect the destination before retrying.', 409);
+  }
+  return names;
 }
 
 function mergeRecoverySchema(current: DatabaseSchema, expected: DatabaseSchema, detached: string[], allowMissing: boolean): DatabaseSchema {
@@ -136,7 +149,7 @@ function mergeRecoverySchema(current: DatabaseSchema, expected: DatabaseSchema, 
 }
 
 async function checkStoragePolicies(input: RestoreInput, schema: DatabaseSchema, context?: OperationContext): Promise<void> {
-  const required = new Set(schema.objects.filter(object => object.kind === 'table').map(object => object.storagePolicy).filter(Boolean));
+  const required = new Set(getDataTables(schema).map(object => object.storagePolicy).filter(Boolean));
   if (required.size === 0) return;
   const policies = await input.client.query<{ name: string }>(input.target,
     'SELECT policy_name AS name FROM system.storage_policies', { context, signal: context?.signal });
@@ -149,12 +162,31 @@ async function checkStoragePolicies(input: RestoreInput, schema: DatabaseSchema,
 
 function restoreActions(mode: RestoreInput['mode'], schema: DatabaseSchema, createDatabase: boolean, missing: SchemaObject[]): string[] {
   const actions: string[] = [];
+  const missingNames = new Set(missing.map(object => object.name));
+  const tables = getCreateTables(schema);
+  const views = orderViews(schema.objects);
   if (mode === 'create-new') {
     if (createDatabase) actions.push(`Create database ${schema.name}`);
-    for (const object of missing) actions.push(`Create ${object.kind} ${object.name}`);
+    for (const table of tables.filter(table => missingNames.has(table.name))) actions.push(`Create table ${table.name}`);
   }
-  for (const object of schema.objects.filter(object => object.kind !== 'table')) actions.push(`Temporarily detach view ${object.name}`);
-  for (const object of schema.objects.filter(object => object.kind === 'table')) actions.push(`Truncate and restore table ${object.name}`);
-  actions.push('Reattach views after all data imports succeed');
+  for (const view of [...views].reverse().filter(view => !missingNames.has(view.name))) {
+    actions.push(isRefreshableView(view)
+      ? `Stop refreshable view ${view.name} and wait for its refresh to finish`
+      : `Temporarily detach view ${view.name}`);
+  }
+  for (const buffer of getBufferTables(schema)) actions.push(`Drain buffer ${buffer.name} and wait for its queued writes before clearing targets`);
+  for (const table of tables) {
+    actions.push(table.engine === 'Buffer'
+      ? `Restore saved memory rows from buffer ${table.name} into table ${table.targetTable}`
+      : `Truncate and restore table ${table.name}`);
+  }
+  for (const view of views) {
+    if (missingNames.has(view.name)) {
+      actions.push(isRefreshableView(view) ? `Create refreshable view ${view.name} without an initial refresh` : `Create ${view.kind} ${view.name}`);
+    } else if (!isRefreshableView(view)) {
+      actions.push(`Reattach view ${view.name}`);
+    }
+  }
+  if (views.some(isRefreshableView)) actions.push('Restore the original refresh schedule states after all data imports succeed');
   return actions;
 }
